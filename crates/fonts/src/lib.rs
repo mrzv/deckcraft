@@ -225,6 +225,8 @@ mod tests {
         assert_eq!(shape(&b, "A", &[], |c| c)[0].x_advance, 900);
         assert_eq!((a.style.as_str(), a.weight), ("Semibold", 600.0));
         assert!(a.legacy.is_none() && b.legacy.is_none());
+        assert_eq!(a.source_family(), "DeckCraft Legacy");
+        assert_eq!(b.source_family(), "DeckCraft Legacy");
         assert_eq!(db.add_document_fonts(files), 0);
         assert_eq!(db.face("document-a", "Semibold").id(), a.id());
         assert_eq!(db.styles("document-a"), ["Semibold"]);
@@ -240,7 +242,183 @@ mod tests {
         assert_eq!(db.add_font(bytes.clone()), 1);
         assert_eq!(db.add_font(bytes), 0);
         assert_eq!(db.face("DeckCraft Legacy Semibold", "Regular").family, "DeckCraft Legacy");
+        assert_eq!(db.face("DeckCraft Legacy", "Semibold").source_family(), "DeckCraft Legacy");
         assert_eq!(db.face("document-b", "Semibold").id(), b.id());
+    }
+
+    fn font_with_table(source: &[u8], tag: &[u8; 4], table: &[u8]) -> Vec<u8> {
+        // Rewrite only the table directory of an existing CC0 fixture; no font assets are added.
+        let count = u16::from_be_bytes([source[4], source[5]]) as usize;
+        let mut records = source[12..12 + count * 16].as_chunks::<16>().0.to_vec();
+        let extra = !records.iter().any(|r| &r[..4] == tag);
+        let shift = if extra { 16 } else { 0 };
+        let mut font = source.to_vec();
+        if extra {
+            drop(font.splice(12..12, [0; 16]));
+            for record in &mut records {
+                let offset = u32::from_be_bytes(record[8..12].try_into().unwrap()) + shift;
+                record[8..12].copy_from_slice(&offset.to_be_bytes());
+            }
+        }
+        while !font.len().is_multiple_of(4) {
+            font.push(0);
+        }
+        let mut record = [0; 16];
+        record[..4].copy_from_slice(tag);
+        record[8..12].copy_from_slice(&(font.len() as u32).to_be_bytes());
+        record[12..16].copy_from_slice(&(table.len() as u32).to_be_bytes());
+        records.retain(|r| &r[..4] != tag);
+        records.push(record);
+        records.sort_by_key(|r| [r[0], r[1], r[2], r[3]]);
+        let count = records.len() as u16;
+        let selector = count.ilog2() as u16;
+        let search_range = (1_u16 << selector) * 16;
+        for (offset, value) in [(4, count), (6, search_range), (8, selector), (10, count * 16 - search_range)] {
+            font[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        for (index, record) in records.iter().enumerate() {
+            font[12 + index * 16..28 + index * 16].copy_from_slice(record);
+        }
+        font.extend_from_slice(table);
+        font
+    }
+
+    fn font_with_cmap(source: &[u8], mappings: &[(char, u32)]) -> Vec<u8> {
+        let mut mappings = mappings.to_vec();
+        mappings.sort_by_key(|(c, _)| *c);
+        // Windows Unicode full-repertoire cmap, with one format-12 group per mapped character.
+        let mut cmap = b"\0\0\0\x01\0\x03\0\x0a\0\0\0\x0c\0\x0c\0\0".to_vec();
+        for value in [16 + mappings.len() as u32 * 12, 0, mappings.len() as u32] {
+            cmap.extend_from_slice(&value.to_be_bytes());
+        }
+        for (c, glyph) in mappings {
+            for value in [c as u32, c as u32, glyph] {
+                cmap.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        font_with_table(source, b"cmap", &cmap)
+    }
+
+    #[test]
+    fn document_aliases_are_explicit_only_for_discovery_and_plain_fallback() {
+        let probe = '\u{10FFFD}';
+        let bytes = font_with_cmap(include_bytes!("../tests/fixtures/legacy-regular.ttf"), &[('A', 1), ('ا', 1), (probe, 1)]);
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        let ordinary = db.face(LAST_RESORT_FAMILY, "Regular");
+        assert!(ordinary.covers('A'));
+        let chain = std::slice::from_ref(&ordinary);
+        // Exercise single-character fallback, whole-cluster scanning, the platform-script
+        // cascade, and text-presentation fallback without borrowing the document's face.
+        let clusters = [vec![probe], vec!['A', probe], vec!['ا', probe], vec![probe, '\u{FE0E}']];
+        let cascades: Vec<u32> = clusters.iter().map(|c| db.cascade(c, chain, "Regular").id()).collect();
+        let families = db.families();
+        let fallback = db.fallback_for(probe, u32::MAX).map(|f| f.id());
+        let plain = db.plain_face_for(probe, &[probe]).map(|f| f.id());
+        assert_eq!(db.add_document_fonts(vec![(bytes.clone(), " DeckCraft Legacy ".into(), "private-plain".into())]), 1);
+        let private = db.document_face("private-plain", "Regular");
+        assert_eq!(private.family, "private-plain");
+        assert_eq!(private.source_family(), "DeckCraft Legacy");
+        assert_eq!(db.styles("private-plain"), ["Regular"]);
+        assert!(db.has_family("private-plain"));
+        assert_eq!(db.families(), families);
+        assert!(!db.has_family("DeckCraft Legacy"));
+        assert_eq!(db.fallback_for(probe, u32::MAX).map(|f| f.id()), fallback);
+        assert_eq!(db.plain_face_for(probe, &[probe]).map(|f| f.id()), plain);
+        assert!(db.fallback_for_filtered(probe, u32::MAX, |f| f.id() == private.id()).is_none());
+        for (cluster, before) in clusters.iter().zip(cascades) {
+            assert_eq!(db.cascade(cluster, chain, "Regular").id(), before);
+            assert_eq!(db.cascade(cluster, std::slice::from_ref(&private), "Regular").id(), private.id());
+        }
+        let shaped = shape(&private, &probe.to_string(), &[], |c| c);
+        assert_eq!((shaped[0].gid, shaped[0].x_advance), (1, 700));
+        // The same synthesized font remains globally discoverable when explicitly added as a user font.
+        assert_eq!(db.add_font(bytes), 1);
+        let public = db.face("DeckCraft Legacy", "Regular");
+        assert!(db.families().iter().any(|family| family == "DeckCraft Legacy"));
+        assert_eq!(db.fallback_for_filtered(probe, u32::MAX, |f| f.id() == public.id()).unwrap().id(), public.id());
+    }
+
+    #[test]
+    fn document_colour_aliases_do_not_enter_global_emoji_fallback() {
+        let probe = '\u{10FFFD}';
+        let emoji = '😀';
+        let bytes = font_with_cmap(include_bytes!("../../render/tests/fixtures/colr-squares.ttf"), &[(emoji, 2), (probe, 2)]);
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        let ordinary = db.face(LAST_RESORT_FAMILY, "Regular");
+        let before = db.cascade(&[emoji], std::slice::from_ref(&ordinary), "Regular").id();
+        let colour = db.color_face_for(probe, &[probe]).map(|f| f.id());
+        let families = db.families();
+        assert_eq!(db.add_document_fonts(vec![(bytes.clone(), "DeckCraft Colr Squares".into(), "private-colour".into())]), 1);
+        let private = db.face("private-colour", "Regular");
+        assert!(private.is_color() && private.covers(emoji));
+        assert_eq!(db.families(), families);
+        assert_eq!(db.color_face_for(probe, &[probe]).map(|f| f.id()), colour);
+        assert_eq!(db.cascade(&[emoji], std::slice::from_ref(&ordinary), "Regular").id(), before);
+        assert_eq!(db.cascade(&[emoji], std::slice::from_ref(&private), "Regular").id(), private.id());
+        assert!(db.fallback_for_filtered(probe, u32::MAX, |f| f.id() == private.id()).is_none());
+        let shaped = shape(&private, &probe.to_string(), &[], |c| c);
+        assert_eq!((shaped[0].gid, shaped[0].x_advance), (2, 1000));
+        assert_eq!(db.add_font(bytes), 1);
+        let public = db.face("DeckCraft Colr Squares", "Regular");
+        assert!(public.is_color());
+        assert_eq!(db.fallback_for_filtered(probe, u32::MAX, |f| f.id() == public.id()).unwrap().id(), public.id());
+    }
+
+    #[test]
+    fn document_variable_instances_preserve_private_source_identity() {
+        let probe = '\u{10FFFD}';
+        let bytes = font_with_cmap(include_bytes!("../tests/fixtures/legacy-regular.ttf"), &[(probe, 1)]);
+        // One real fvar weight axis; outlines stay those of the existing CC0 square fixture.
+        let mut fvar = b"\0\x01\0\0\0\x10\0\x02\0\x01\0\x14\0\0\0\x08wght".to_vec();
+        for value in [100_i32, 400, 900] {
+            fvar.extend_from_slice(&(value << 16).to_be_bytes());
+        }
+        fvar.extend_from_slice(&[0, 0, 1, 0]);
+        let bytes = font_with_table(&bytes, b"fvar", &fvar);
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        assert_eq!(db.add_document_fonts(vec![(bytes.clone(), "Declared variable".into(), "private-variable".into())]), 1);
+        assert_eq!(db.axes("private-variable", "Regular").len(), 1);
+        let base = db.face("private-variable", "Regular");
+        let instance = db.face("private-variable", "Regular {wght:650}");
+        assert_ne!(instance.id(), base.id());
+        assert_eq!(instance.weight, 650.0);
+        assert_eq!(instance.source_family(), "Declared variable");
+        assert!(instance.legacy.is_none());
+        assert_eq!(db.face("private-variable", "Regular {wght:650}").id(), instance.id());
+        assert_eq!(db.styles("private-variable"), ["Regular"]);
+        assert!(!db.families().iter().any(|family| family == "private-variable"));
+        assert!(db.fallback_for_filtered(probe, u32::MAX, |f| f.id() == instance.id()).is_none());
+        assert_eq!(db.cascade(&[probe], std::slice::from_ref(&instance), "Regular").id(), instance.id());
+        assert_eq!(shape(&instance, &probe.to_string(), &[], |c| c)[0].gid, 1);
+        assert_eq!(db.add_font(bytes), 1);
+        let public = db.face("DeckCraft Legacy", "Regular {wght:650}");
+        assert_eq!(public.source_family(), "DeckCraft Legacy");
+        assert_eq!(db.fallback_for_filtered(probe, u32::MAX, |f| f.id() == public.id()).unwrap().id(), public.id());
+    }
+
+    #[test]
+    fn private_aliases_matching_global_fallback_names_are_not_implicitly_selected() {
+        let bytes = include_bytes!("../tests/fixtures/legacy-regular.ttf").to_vec();
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        assert_eq!(
+            db.add_document_fonts(vec![
+                (bytes.clone(), "DeckCraft Legacy".into(), "Calibri".into()),
+                (bytes, "DeckCraft Legacy".into(), "Arial".into()),
+            ]),
+            2
+        );
+        let aliases = [db.face("Calibri", "Regular").id(), db.face("Arial", "Regular").id()];
+        for requested in ["Unknown document family", "Arial CE"] {
+            assert!(!aliases.contains(&db.document_face(requested, "Regular").id()), "{requested}");
+        }
+        for requested in ["Unknown family", "Helvetica", "Calibri Light"] {
+            assert!(!aliases.contains(&db.face(requested, "Regular").id()), "{requested}");
+        }
+        assert!(!db.families().iter().any(|family| matches!(family.as_str(), "Calibri" | "Arial")));
     }
 
     fn font_collection(sources: [&[u8]; 2]) -> Vec<u8> {
@@ -536,16 +714,38 @@ mod tests {
         assert!(feature("liga").is_some());
     }
 
+    /// When the Latin build input exists, the runtime catalogue carries the expected Latin faces;
+    /// required builds also assert their presence.
     #[test]
     fn craft_fonts_latin_when_present() {
+        let required = option_env!("CRAFT_FONTS_REQUIRED").is_some();
         if !CRAFT_FONTS.iter().any(|f| f.family == "Inter") {
+            assert!(!required, "CRAFT_FONTS_REQUIRED must embed Inter rather than skip the optional Latin manifest");
             eprintln!("skipped: built without craft-fonts' Latin manifest (set CRAFT_FONTS_DIR)");
             return;
+        }
+        let inter = |style: &str| CRAFT_FONTS.iter().find(|f| f.family == "Inter" && f.style == style);
+        let (regular, bold, variable) = (inter("Regular"), inter("Bold"), inter("Variable"));
+        if required {
+            assert!(
+                variable.is_some() || (regular.is_some() && bold.is_some()),
+                "CRAFT_FONTS_REQUIRED must embed Inter Regular and Bold (or a Variable face)"
+            );
         }
         let db = FontDb::with_font_dirs(Vec::new());
         db.set_system_fallback(false);
         assert_eq!(db.face("Inter", "Regular").family, "Inter");
         assert_eq!(db.face("Aptos", "Regular").family, "Inter");
+        if let (Some(regular), Some(bold)) = (regular, bold) {
+            // The build input carries one entry per face; real static Bold must not be the Regular
+            // file relabelled in the manifest.
+            assert_ne!(regular.bytes, bold.bytes, "Inter Bold must be a distinct face file from Regular");
+            let (r, b) = (db.face("Inter", "Regular"), db.face("Inter", "Bold"));
+            assert_eq!((r.family.as_str(), r.style.as_str()), ("Inter", "Regular"));
+            assert_eq!((b.family.as_str(), b.style.as_str()), ("Inter", "Bold"));
+            assert_ne!(r.id(), b.id(), "Inter Bold must load as its own face");
+            assert!(b.weight > r.weight, "Inter Bold weight {} is not above Regular {}", b.weight, r.weight);
+        }
         if CRAFT_FONTS.iter().any(|f| f.family == "Carlito") {
             assert_eq!(db.face("Calibri", "Bold").family, "Carlito");
         }

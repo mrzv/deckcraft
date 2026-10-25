@@ -2,9 +2,9 @@
 //! `deckcraft-metafile` and drawn as vectors into a bitmap of the size the slide needs, so they go
 //! through the same crop, tile and recolour path as any other picture.
 //!
-//! Text items name the font the file asks for; they are drawn with the face slide text would use
-//! for that family (`FontDb::document_face`, so a missing font falls back the same way), symbol
-//! fonts mapped as bullets map them, and the file's own advances (the dx array) placing each
+//! Text items keep the source family for symbol mapping, while document rendering resolves it
+//! through the presentation's private font aliases before `FontDb::document_face` lookup.
+//! Missing fonts fall back as slide text does, and the file's own advances (the dx array) place each
 //! character.
 
 use std::collections::HashMap;
@@ -34,6 +34,11 @@ pub fn is_metafile(bytes: &[u8]) -> bool {
 /// Draw the metafile `bytes` into straight RGBA with its longer side `side` px (transparent where
 /// it draws nothing). `None` when it doesn't parse or has no size.
 pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
+    rasterize_in(bytes, side, None)
+}
+
+/// Draw with the containing document's private fonts, or ordinary fonts for standalone export.
+pub(crate) fn rasterize_in(bytes: &[u8], side: u32, pres: Option<&deckcraft_model::Presentation>) -> Option<image::RgbaImage> {
     let mut pic = deckcraft_metafile::parse(bytes).ok()?;
     if !pic.has_size() {
         return None;
@@ -51,7 +56,7 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
     ctx.push_clip_layer(&r.to_path(0.1));
     for it in pic.place(r, [0.0; 4]) {
         match it {
-            PlacedItem::Path { path, fill, stroke, even_odd, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+            PlacedItem::Path { path, fill, stroke, even_odd, region } => clipped(&mut ctx, region.as_deref(), |ctx| {
                 if let Some(f) = fill {
                     ctx.set_paint(rgba(f));
                     ctx.set_fill_rule(if even_odd { peniko::Fill::EvenOdd } else { peniko::Fill::NonZero });
@@ -64,7 +69,7 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
                     ctx.stroke_path(&path);
                 }
             }),
-            PlacedItem::Bitmap { index, rect, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+            PlacedItem::Bitmap { index, rect, region } => clipped(&mut ctx, region.as_deref(), |ctx| {
                 let Some(Some(pm)) = pixmaps.get(index) else { return };
                 let (bw, bh) = (pm.width().max(1) as f64, pm.height().max(1) as f64);
                 ctx.set_paint(vello_cpu::Image {
@@ -75,7 +80,7 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
                 ctx.fill_rect(&rect);
                 ctx.reset_paint_transform();
             }),
-            PlacedItem::Pattern { index, path, even_odd, tile, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+            PlacedItem::Pattern { index, path, even_odd, tile, region } => clipped(&mut ctx, region.as_deref(), |ctx| {
                 let Some(Item::Pattern { tile: t, .. }) = pic.items.get(index) else { return };
                 let key = Arc::as_ptr(t);
                 let (pm, avg) = tiles.entry(key).or_insert_with(|| (premul(t.width, t.height, &t.rgba), average(&t.rgba))).clone();
@@ -102,12 +107,12 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
                     }
                 }
             }),
-            PlacedItem::Text { index, transform, clip, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+            PlacedItem::Text { index, transform, clip, region } => clipped(&mut ctx, region.as_deref(), |ctx| {
                 let Some(Item::Text(t)) = pic.items.get(index) else { return };
                 if let Some(c) = clip {
                     ctx.push_clip_layer(&c.to_path(0.1));
                 }
-                draw_text(ctx, t, transform);
+                draw_text(ctx, t, transform, pres);
                 if clip.is_some() {
                     ctx.pop_layer();
                 }
@@ -154,7 +159,7 @@ struct Glyph {
 }
 
 /// Draws a text item; `m` maps its text space to the output.
-fn draw_text(ctx: &mut RenderContext, t: &Text, m: Affine) {
+fn draw_text(ctx: &mut RenderContext, t: &Text, m: Affine, pres: Option<&deckcraft_model::Presentation>) {
     let db = FontDb::global();
     let font = &t.font;
     let family = if font.family.trim().is_empty() { "Arial" } else { font.family.trim() };
@@ -165,7 +170,8 @@ fn draw_text(ctx: &mut RenderContext, t: &Text, m: Affine) {
         (false, true) => "Italic",
         (false, false) => "Regular",
     };
-    let face = db.document_face(family, style);
+    let lookup_family = pres.map_or(family, |p| p.render_font_family(family));
+    let face = db.document_face(lookup_family, style);
     let upem = face.upem.max(1.0);
     let (asc, desc) = win_metrics(&face);
     // LOGFONT height: negative is the em, positive the cell (ascent plus descent).
@@ -281,7 +287,14 @@ fn draw_text(ctx: &mut RenderContext, t: &Text, m: Affine) {
         let s = em / g.face.upem.max(1.0);
         let skew = if italic && !g.face.italic { Affine::new([1.0, 0.0, -0.2, 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
         let gm = at * Affine::translate((g.x, g.y)) * Affine::scale_non_uniform(x_scale, 1.0) * skew * Affine::scale(s);
+        let sc = scale_of(gm);
+        if !sc.is_finite() || sc > 1e5 {
+            continue;
+        }
         let p: BezPath = gm * path.as_ref().clone();
+        if p.elements().len() > 10_000 || p.bounding_box().width() > 1e6 || p.bounding_box().height() > 1e6 {
+            continue;
+        }
         ctx.fill_path(&p);
         if bold && g.face.weight < 600.0 {
             ctx.set_stroke(kurbo::Stroke::new(em * 0.025 * scale_of(at)).with_join(kurbo::Join::Round));

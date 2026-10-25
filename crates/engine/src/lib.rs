@@ -163,6 +163,8 @@ pub struct HistoryEntry {
     pub label: String,
     pub doc: Arc<Presentation>,
     pub selection: Selection,
+    /// The point type Edit Points remembered with `doc` (`ToolState::vertex_kind`).
+    pub vertex_kind: Option<(ShapeId, usize, usize, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,6 +186,8 @@ pub struct Interaction {
     pub label: String,
     pub doc: Arc<Presentation>,
     pub selection: Selection,
+    /// The point type Edit Points remembered when it began.
+    pub vertex_kind: Option<(ShapeId, usize, usize, String)>,
 }
 
 /// Text an input method is composing (#101): its preedit sits in the edited text body, at `start`
@@ -222,6 +226,12 @@ pub struct DocState {
     pub composition: Option<Composition>,
     /// Review › Compare in progress: the revised copy.
     pub compare: Option<compare::Compare>,
+    /// The last Duplicate: where it happened and each original with its copy, so duplicating the
+    /// copies again repeats how far they were moved, as in PowerPoint (#966).
+    pub last_duplicate: Option<(usize, Target, Vec<(ShapeId, ShapeId)>)>,
+    /// The list AutoFormat just started from a typed `* ` or `1. `, so Backspace right after
+    /// can put the typed text back.
+    pub auto_list: Option<cmd::text::AutoList>,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -234,7 +244,9 @@ fn next_uid() -> u64 {
 }
 
 impl DocState {
-    pub fn new(doc: Presentation, path: Option<String>, title: String) -> Self {
+    pub fn new(mut doc: Presentation, path: Option<String>, title: String) -> Self {
+        fonts::install_embedded_fonts(&mut doc);
+        let missing_fonts = fonts::missing_fonts(&doc);
         let doc = Arc::new(doc);
         DocState {
             saved_doc: doc.clone(),
@@ -246,9 +258,11 @@ impl DocState {
             interaction: None,
             uid: next_uid(),
             title,
-            missing_fonts: Vec::new(),
+            missing_fonts,
             composition: None,
             compare: None,
+            last_duplicate: None,
+            auto_list: None,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -324,13 +338,15 @@ pub struct Prefs {
     pub smart_quotes: bool,
     /// AutoCorrect options (Tools ▸ AutoCorrect): fix TWo INitial CApitals, capitalize the first
     /// letter of sentences and the names of days, fix accidental cAPS lOCK, and replace 1/2, 1/4
-    /// and 3/4 with fraction characters; AutoFormat superscripts ordinals (1st) as you type.
+    /// and 3/4 with fraction characters; AutoFormat superscripts ordinals (1st) and starts
+    /// bulleted and numbered lists (`* `, `1. `) as you type.
     pub ac_two_initials: bool,
     pub ac_sentence_caps: bool,
     pub ac_days: bool,
     pub ac_caps_lock: bool,
     pub ac_fractions: bool,
     pub ac_ordinals: bool,
+    pub ac_lists: bool,
     /// Your own "replace … with …" entries; they win over the built-in list.
     pub ac_entries: Vec<(String, String)>,
     /// Built-in entries you deleted.
@@ -356,6 +372,7 @@ impl Default for Prefs {
             ac_caps_lock: true,
             ac_fractions: true,
             ac_ordinals: true,
+            ac_lists: true,
             ac_entries: Vec::new(),
             ac_removed: Vec::new(),
             author: "Presenter".into(),
@@ -441,6 +458,11 @@ pub struct Clipboard {
     /// The copied shapes' theme colours (colour map applied) and fonts, for Paste Special ›
     /// Keep Source Formatting.
     pub source_theme: Option<(deckcraft_color::ColorScheme, deckcraft_model::theme::FontScheme)>,
+    /// Runtime font scope retained for Paste Special › Picture, without changing saved names.
+    pub source_font_aliases: Arc<Vec<(String, String)>>,
+    /// Embedded definitions and font bytes available to formatting-preserving paste.
+    pub source_fonts: Vec<deckcraft_model::EmbeddedFont>,
+    pub source_font_media: Vec<deckcraft_model::MediaItem>,
     /// How many times the shapes were pasted (each paste offsets further).
     pub pastes: u32,
 }
@@ -478,6 +500,8 @@ pub struct Session {
     /// Presentations a host read off the UI thread, waiting for `file.adopt` (by token).
     loaded: Vec<(u64, cmd::file::LoadedFile)>,
     next_loaded: u64,
+    /// Compositions the application settled itself (see [`Session::composition_settles`]).
+    composition_settles: u64,
 }
 
 impl Default for Session {
@@ -487,6 +511,8 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Install the process panic hook and construct an empty session with default preferences,
+    /// clipboard, tool state, and no active document.
     pub fn new() -> Self {
         guard::install_panic_hook();
         Session {
@@ -509,6 +535,7 @@ impl Session {
             panics_caught: 0,
             loaded: vec![],
             next_loaded: 0,
+            composition_settles: 0,
         }
     }
     /// Hand over a presentation read on another thread ([`cmd::file::read_presentation_file`]);
@@ -553,22 +580,35 @@ impl Session {
         self.active_mut().ok_or(EngineError::NoDocument)
     }
     pub fn set_active(&mut self, i: usize) {
+        let was = self.active().map(|d| d.uid);
         if i < self.docs.len() {
             self.active = Some(i);
         }
+        self.forget_vertex_kind_unless(was);
     }
     pub fn add_document(&mut self, d: DocState) -> usize {
+        let was = self.active().map(|d| d.uid);
         self.docs.push(d);
         self.active = Some(self.docs.len() - 1);
+        self.forget_vertex_kind_unless(was);
         self.docs.len() - 1
     }
     pub fn close_document(&mut self, i: usize) {
+        let was = self.active().map(|d| d.uid);
         if i < self.docs.len() {
             let d = self.docs.remove(i);
             if let Some(dir) = &self.recovery_dir {
                 recovery::discard(dir, d.uid);
             }
             self.active = if self.docs.is_empty() { None } else { Some(i.min(self.docs.len() - 1)) };
+        }
+        self.forget_vertex_kind_unless(was);
+    }
+    /// The point type Edit Points remembers names a shape of the active document, and another
+    /// document can have a shape with the same id: a change of active document forgets it.
+    fn forget_vertex_kind_unless(&mut self, was: Option<u64>) {
+        if self.active().map(|d| d.uid) != was {
+            self.tool.vertex_kind = None;
         }
     }
     pub fn next_untitled(&mut self) -> String {
@@ -582,11 +622,13 @@ impl Session {
         self.guarded(id, |s| s.execute_unguarded(id, params))
     }
 
+    /// Resolve and run a command, settling composition first, checking eligibility, rolling back a
+    /// failed outer command, and committing the resulting undo entry or journal record.
     fn execute_unguarded(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.into()))?;
         // Any other edit (or a click, a key, undo) settles an input method's composition first.
         if self.depth == 0 && (spec.journal || spec.undoable) && !matches!(id, "text.compose" | "text.commit") {
-            self.end_composition();
+            self.settle_composition();
         }
         if let Err(e) = (spec.enabled)(self) {
             let named = (e == cmd::NOTHING_SELECTED || e == cmd::SELECT_TWO) && (params.get("ids").is_some() || params.get("id").is_some());
@@ -595,6 +637,7 @@ impl Session {
             }
         }
         let before = self.active().map(|d| (d.uid, d.doc.clone(), d.selection.clone()));
+        let vertex_kind = self.tool.vertex_kind.clone();
         let outer = self.depth == 0;
         self.depth += 1;
         let r = (spec.run)(self, params);
@@ -613,6 +656,9 @@ impl Session {
                     st.selection = sel;
                     st.revision += 1;
                 }
+                if outer {
+                    self.tool.vertex_kind = vertex_kind;
+                }
                 return Err(e);
             }
         };
@@ -626,7 +672,7 @@ impl Session {
             && spec.undoable
             && outer
         {
-            push_undo(st, HistoryEntry { label: spec.label.to_string(), doc: old, selection: sel });
+            push_undo(st, HistoryEntry { label: spec.label.to_string(), doc: old, selection: sel, vertex_kind });
         }
         if spec.journal && outer {
             self.journal.push((id.to_string(), params.clone()));
@@ -656,12 +702,37 @@ impl Session {
 
     /// Keep an input method's composition as it stands (#101): its text stays and the whole
     /// composition becomes one undo step. Nothing happens without one.
+    ///
+    /// This is also how the input method's own commit ends a composition: the platform has
+    /// already finished that one, so it must not ask for an interrupt.
     pub fn end_composition(&mut self) {
+        let vertex_kind = self.tool.vertex_kind.clone();
         let Some(st) = self.active_mut() else { return };
         let Some(c) = st.composition.take() else { return };
         if !Arc::ptr_eq(&c.before, &st.doc) {
-            push_undo(st, HistoryEntry { label: "Type Text".into(), doc: c.before, selection: c.before_selection });
+            push_undo(st, HistoryEntry { label: "Type Text".into(), doc: c.before, selection: c.before_selection, vertex_kind });
         }
+    }
+
+    /// Settle a composition because the application did something else (a click, a key, a
+    /// command, a target change) rather than because the input method committed it.
+    ///
+    /// The platform still holds its own copy of that composition, so a host must publish one
+    /// `should_interrupt_composition` for each increment of [`Self::composition_settles`]: the
+    /// backend then cancels it instead of committing its text into whatever is selected next.
+    pub fn settle_composition(&mut self) {
+        if self.active().is_some_and(|d| d.composition.is_some()) {
+            self.composition_settles = self.composition_settles.wrapping_add(1);
+        }
+        self.end_composition();
+    }
+
+    /// How many compositions the application settled itself (clicks, keys, other commands).
+    ///
+    /// A host compares this with the value it last published; every increment is one platform
+    /// composition that must be interrupted. The input method's own commits do not count.
+    pub fn composition_settles(&self) -> u64 {
+        self.composition_settles
     }
 
     /// Change only the selection (no undo step).
@@ -679,7 +750,7 @@ impl Session {
         st.revision += 1;
         // A composition belongs to the text body it began in: leaving that body settles it.
         if st.composition.is_some() && owner(&st.selection) != before {
-            self.end_composition();
+            self.settle_composition();
         }
         Ok(())
     }
@@ -781,5 +852,7 @@ pub(crate) fn push_undo(st: &mut DocState, e: HistoryEntry) {
 mod soak_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_document_fonts;
 #[cfg(test)]
 mod tests_keys;
